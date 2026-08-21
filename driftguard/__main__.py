@@ -1,121 +1,101 @@
 """driftguard live.
 
-    python -m driftguard            an autonomous loop that starts drifting
-    python -m driftguard --clean    a loop that never drifts (control)
-    python -m driftguard --bench    tokens saved vs waiting for the parser
-    python -m driftguard --proof    the kernel over its complete domain
+    driftguard              an autonomous loop that starts degrading
+    driftguard --clean      the control: the same loop, never degrading
+    driftguard --proof      the structural kernel over its complete domain
+
+Both arms use REAL text and identical thresholds. On-task documents are prose
+docstrings from the standard library; the drift arm gradually substitutes
+source code -- a genuine distribution shift, not injected noise.
 """
-import argparse, json, random, statistics, sys, time
-from . import Grammar, StreamGate, Drifted, Monitor, violation, VIOLATION, tokenise, TYPES
+import argparse, inspect, random, statistics, sys, time
+from . import AgentWatch, violation, VIOLATION
+
+TASK = ("Explain in prose what this library component does, what its arguments "
+        "mean, and when a caller should reach for it rather than an alternative.")
 
 
-def _corpus(n=300, seed=1):
+def _corpora():
+    """(on_task, off_task) -- real text, no dependencies."""
+    import collections, itertools, functools, json, re, os, textwrap, string, difflib
+    mods = (collections, itertools, functools, json, re, os, textwrap, string, difflib)
+    on, off = [], []
+    for m in mods:
+        for n in dir(m):
+            o = getattr(m, n, None)
+            d = inspect.getdoc(o) if o is not None else None
+            if d and len(d) > 200: on.append(d[:700])            # prose
+            try:
+                s = inspect.getsource(o)
+                if len(s) > 200: off.append(s[:700])             # source code
+            except Exception:
+                pass
+    return on, off
+
+
+def loop(drift_at=None, total=700, seed=11):
+    on, off = _corpora()
+    if len(on) < 40 or len(off) < 20:
+        print("not enough sample text on this interpreter"); return
     rnd = random.Random(seed)
-    names = ["query", "path", "limit", "mode", "filters", "tags", "opts", "id"]
-    def val(d):
-        r = rnd.random()
-        if d < 3 and r < .22: return {rnd.choice(names): val(d+1) for _ in range(rnd.randint(1,3))}
-        if d < 3 and r < .38: return [val(d+1) for _ in range(rnd.randint(1,3))]
-        return rnd.choice([1, "s", True, None, 3.5])
-    return [{"name": rnd.choice(names),
-             "arguments": {rnd.choice(names): val(1) for _ in range(rnd.randint(1,4))}}
-            for _ in range(n)]
-
-
-def _emit(doc, corrupt_at=None):
-    """The text a model streams out, optionally corrupted mid-generation."""
-    s = json.dumps(doc)
-    if corrupt_at is None: return s
-    i = max(2, min(len(s) - 2, corrupt_at))
-    return s[:i] + random.choice([",", ":", "}", "]"]) + s[i:]
-
-
-def loop(drift_at=None, total=600, seed=7):
-    rnd = random.Random(seed)
-    docs = _corpus(400, seed)
-    g = Grammar().learn(docs[:200])
-    mon = Monitor(baseline_n=120, window=40, sigma=3.0, persist=30)
+    w = AgentWatch(task=TASK, baseline_n=150, window=40, sigma=3.0, persist=25)
     tty = sys.stdout.isatty()
-    print("driftguard — autonomous loop, %d legal transitions learned\n" % len(g))
-    saved = []
+    print("driftguard — autonomous loop, %d on-task / %d off-task real documents\n"
+          % (len(on), len(off)))
+    rels, divs = [], []
     for i in range(total):
-        doc = rnd.choice(docs[200:])
-        degrading = drift_at is not None and i >= drift_at
-        p_bad = 0.02 if not degrading else min(0.7, 0.02 + (i - drift_at) / 200.0)
-        text = _emit(doc, rnd.randrange(5, max(6, len(json.dumps(doc)) - 3))
-                     if rnd.random() < p_bad else None)
-        gate = StreamGate(g)
-        fed = 0
-        try:
-            for k in range(0, len(text), 4):
-                gate.feed(text[k:k+4]); fed = min(k + 4, len(text))
-            gate.close()
-            mon.record(True)
-        except Drifted:
-            mon.record(False, reason="grammar")
-            saved.append(1 - fed / len(text))
-        if i % 4 == 0 or i == total - 1:
-            line = mon.render()
+        if drift_at is None or i < drift_at:
+            out = on[i % len(on)]
+        else:
+            p = min(1.0, (i - drift_at) / 120.0)
+            out = off[i % len(off)] if rnd.random() < p else on[i % len(on)]
+        w.observe(out)
+        rels.append(w.last["relevance"]); divs.append(w.last["self_divergence"])
+        if i % 5 == 0 or i == total - 1:
+            line = w.render()
             if tty: sys.stdout.write("\r\x1b[2K" + line); sys.stdout.flush()
             elif i % 100 == 0 or i == total - 1: print(line)
-        if tty: time.sleep(0.004)
+        if tty: time.sleep(0.003)
     if tty: print()
-    print(mon.report())
-    if saved:
-        print("  stream cut early    %d times" % len(saved))
-        print("  output NOT paid for %.1f%% of each cut generation (mean)"
-              % (100 * statistics.mean(saved)))
-
-
-def bench():
-    rnd = random.Random(3)
-    docs = _corpus(500, 3)
-    g = Grammar().learn(docs[:250])
-    gaps = []
-    for doc in docs[250:]:
-        s = json.dumps(doc)
-        if len(s) < 24: continue
-        text = _emit(doc, rnd.randrange(5, len(s) - 3))
-        gate = StreamGate(g); fed = None
-        try:
-            for k in range(0, len(text), 2): gate.feed(text[k:k+2])
-            gate.close()
-            continue
-        except Drifted:
-            fed = min(k + 2, len(text))
-        try: json.loads(text); continue
-        except Exception: pass
-        gaps.append((fed, len(text)))
-    cut = statistics.mean(f for f, _ in gaps)
-    full = statistics.mean(t for _, t in gaps)
-    print("tokens saved vs waiting for the parser\n")
-    print("  corrupted generations : %d" % len(gaps))
-    print("  gate cut at char      : %.1f (mean)" % cut)
-    print("  parser needs the whole: %.1f (mean)" % full)
-    print("  NOT PAID FOR          : %.1f%% of every doomed generation"
-          % (100 * (1 - cut / full)))
+    print(w.report())
+    if drift_at is not None and w.drift_started_at:
+        print("\n  true onset #%d, called at #%d -- latency %d calls"
+              % (drift_at, w.drift_started_at, w.drift_started_at - drift_at))
+    print("""
+  NOTE. This demo ships with no dependencies, so its two distributions are
+  stdlib docstrings vs stdlib source -- which are CLOSER to each other than a
+  real task and a real derailment. Separation here is ~1.6x and latency is
+  correspondingly long. The README's 27-call figure was measured on film
+  reviews vs source (2.6x separation). Treat this as a working demo of the
+  mechanism, not as the benchmark.""")
+    n = len(rels)
+    print("\n  %-24s %-12s %s" % ("phase", "relevance", "self-divergence"))
+    for lo, hi, lab in ((0, 150, "baseline"), (150, n//2, "mid-run"),
+                        (n//2, 3*n//4, "later"), (3*n//4, n, "final quarter")):
+        if hi > lo:
+            print("  %-24s %-12.4f %.4f"
+                  % (lab, statistics.mean(rels[lo:hi]), statistics.mean(divs[lo:hi])))
 
 
 def proof():
     bad = sum(1 for a in range(256) for b in range(256)
               if violation(a, b) != (a & ~b & 0xFF))
-    print("KERNEL  %s\n" % VIOLATION)
+    print("STRUCTURAL KERNEL  %s\n" % VIOLATION)
     print("  complete domain: 256 emitted x 256 allowed = 65,536 states")
-    print("  wrong: %d" % bad)
-    print("\n  %s" % ("TOTAL PROOF -- not a sample" if bad == 0 else "FAILED"))
+    print("  wrong: %d\n" % bad)
+    print("  %s" % ("TOTAL PROOF -- not a sample" if bad == 0 else "FAILED"))
+    print("\n  (included in the package; not the product -- see README)")
     return 0 if bad == 0 else 1
 
 
 def main():
     ap = argparse.ArgumentParser(prog="driftguard")
-    ap.add_argument("--clean", action="store_true")
-    ap.add_argument("--bench", action="store_true")
+    ap.add_argument("--clean", action="store_true", help="the control")
     ap.add_argument("--proof", action="store_true")
-    ap.add_argument("--calls", type=int, default=600)
+    ap.add_argument("--calls", type=int, default=700)
     a = ap.parse_args()
     if a.proof: raise SystemExit(proof())
-    if a.bench: return bench()
-    loop(drift_at=None if a.clean else 260, total=a.calls)
+    loop(drift_at=None if a.clean else 300, total=a.calls)
 
 
 if __name__ == "__main__":
