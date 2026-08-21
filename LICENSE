@@ -1,0 +1,24 @@
+DRIFTGUARD — COMMERCIAL LICENSE
+Copyright (c) 2026. All rights reserved.
+
+This software is proprietary. It is NOT open source and is NOT distributed
+under any OSI-approved licence.
+
+GRANT. On purchase of a valid licence, the licensee is granted a non-exclusive,
+non-transferable right to use, modify and integrate this software in their own
+products and services, including commercial ones, for the seats or entities
+named in that licence.
+
+RESTRICTIONS. The licensee may not redistribute, resell, sublicense, publish or
+open-source this software or any derivative of it, in source or compiled form,
+as a standalone product or as the substantial value of a product. Integration
+into a larger work that is not itself a drift-detection or schema-validation
+product is permitted.
+
+NO WARRANTY. Provided "as is", without warranty of any kind. The measured
+figures in README.md are reproducible on the author's hardware with the
+included scripts; they are measurements, not guarantees, and performance on
+other corpora, grammars or hardware will differ.
+
+The authoring engine used to synthesise the kernel in driftguard/kernel.py is
+not included in this distribution and is not licensed by it.
