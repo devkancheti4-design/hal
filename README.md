@@ -1,128 +1,95 @@
 # driftguard
 
-**Your agent burns a third of its output tokens after the generation is already
-invalid.** driftguard cuts at the first illegal bit — mid-stream, before the
-rest is paid for.
+**Know when your agent starts degrading — at call #327, not after your users
+complain.**
 
 ```python
-from driftguard import Grammar, StreamGate, Drifted
+from driftguard import AgentWatch
 
-gate = StreamGate(Grammar().learn(examples_your_model_should_emit))
-try:
-    for chunk in client.messages.stream(...):
-        gate.feed(chunk)
-except Drifted as d:
-    abort()          # every token after this one was already wasted
+watch = AgentWatch(task="the objective you gave the agent")
+for step in loop:
+    out = agent.step()
+    if watch.observe(out).drifting:
+        halt()          # it is degrading, not just wrong once
 ```
 
 ---
 
-## Why a parser is too late
+## The problem
 
-A JSON parser cannot fail until the document closes. It needs the whole thing.
-By then the model has already streamed — and you have already paid for — every
-token after the output went wrong.
+An autonomous agent does not fail loudly. It goes gradually off-task — losing
+the thread, repeating itself, answering a question nobody asked — and keeps
+billing you for every step. Nothing in your stack watches for that. Your
+provider validates JSON; it does not tell you the agent stopped doing the job.
 
-driftguard tracks the **generation state vector** as it advances:
+## Measured on real text
 
-```
-x = onehot(token_type) | (allowed_mask << 16)
-```
-
-and tests each transition against the grammar in **four operations**, in
-registers, no allocation, no parse.
+Same detector, same thresholds, both arms. On-task documents are real reviews;
+the drift arm shifts corpus at call #300.
 
 ```
-corrupted generations : 113
-gate cut at char      : 56.7  (mean)
-parser needs the whole: 85.5  (mean)
-NOT PAID FOR          : 33.7% of every doomed generation
+CONTROL — on-task throughout        DRIFT — shifts at call #300
+  rejected      1  (0.14%)            rejected    158  (22.57%)
+  self-divergence  0.2502             self-divergence  0.6598
+  DRIFT         NOT called            DRIFT       called at #327
+                                      latency     27 calls after onset
 ```
 
-Reproduce: `python -m driftguard --bench`
+**Zero false alarms on a healthy agent.** Detection 27 calls after real onset.
 
-## The kernel
-
-```
-((x & 255) ^ (x & (x >> 16)))
-```
-
-Four operations. Not written by hand — synthesised by a program-synthesis
-engine from a transition matrix read off real JSON, and **exact on all 65,536
-states of its complete domain**, not sampled.
+## Two signals, both against the agent's own history
 
 ```
-complete domain: 256 emitted x 256 allowed = 65,536 states
-wrong: 0                          TOTAL PROOF -- not a sample
+relevance     is the output still about the task it was given?
+self-drift    has the output distribution moved away from what THIS agent
+              produced while it was working?
 ```
 
-Reproduce: `python -m driftguard --proof`
+Neither needs an external notion of "correct". Nothing is assumed except that
+the agent used to be self-consistent and on-topic — which is the only thing you
+can actually check without a human in the loop.
 
-On real documents:
+## Drift is not one bad step
+
+One bad output is noise. Drift is the rate **rising and staying risen** against
+this agent's own baseline, measured in standard errors and only called when the
+breach persists.
+
+An earlier one-window detector fired on the healthy control. It is now required
+to hold for 25 consecutive windows, and the control above reports nothing.
+
+## Honest limits
+
+- **Self-divergence has a noise floor.** A 40-document window naturally diverges
+  from a 150-document baseline: the control sits at 0.2502 with no drift at all.
+  The signal (0.6598) is 2.6x that floor, but the floor is real and any
+  threshold must sit above it.
+- **Relevance is bag-of-words by default.** No model, no API call, no embedding
+  — deliberately, so it costs nothing per step. Swap in embeddings if your task
+  needs semantic rather than lexical overlap; the statistics downstream are
+  identical.
+- **27-call latency is not instant.** That lag is what buys zero false alarms.
+  A detector that fires in one call fires on healthy agents too — measured.
+- **It tells you to stop. It does not fix the agent.**
+
+## Structural gating is included, and is not the product
+
+`Grammar`, `StreamGate` and the 4-operation kernel ship in the package and are
+exact on their complete domain. They are not what you are buying: constrained
+decoding from your provider already covers JSON structure. They are there for
+grammars your provider does not enforce.
 
 ```
-legal transitions   5,050 / 5,050 admitted   (100.0%)
-illegal transitions   167 /   167 rejected   (100.0%)
+python -m driftguard --proof     the kernel over all 65,536 states, 0 wrong
 ```
-
-No false accepts. No false rejects. At the bit level the question is a subset
-test, which is precisely what the kernel computes.
-
-## Drift, not noise
-
-One bad call is noise. Drift is the reject rate **rising and staying risen**
-against what this model was doing before — measured in standard errors of the
-baseline, and only called when the breach persists.
-
-```
-DRIFTING LOOP                        CONTROL
-  rejected 92 (15.33%)                 rejected 8 (1.33%)
-  baseline 0.83% -> now 37.50%         baseline 0.83% -> now 0.00%
-  DRIFT began at call #332             no drift reported
-  output NOT paid for 46.1%
-```
-
-Reproduce: `python -m driftguard` and `python -m driftguard --clean`
-
-## It learns YOUR schema
-
-```python
-g = Grammar().learn(list_of_python_objects)     # what your model should emit
-g = Grammar().learn_text(list_of_json_strings)  # or raw output you have logged
-```
-
-The grammar is read off your own documents, so the gate enforces your contract,
-not a generic one.
-
-## What it does not do
-
-- **It does not check values.** `{"limit": "cat"}` is structurally perfect. This
-  gate sees structure, not types or ranges.
-- **It does not check keyword names.** Grammar is over token *types* and depth.
-- **A shape absent from your training examples reads as illegal.** The control
-  run's 1.33% floor is exactly this. Learn from more of your own output.
-- **It is a cut, not a repair.** It tells you to stop; it does not fix the call.
-
-## Streaming caveat
-
-Chunked feeds split tokens: `{"nam` scans differently from `{"name":`. The gate
-holds the final token back until further text settles it, and `close()`
-validates the last transition. Feed whatever chunk sizes your provider gives —
-it is handled — but call `close()` when the stream ends.
-
-## Porting
-
-The kernel is authored under **wrapping int32** semantics. Signed overflow is
-undefined behaviour in C and C++, and `-O3` will miscompile it. Compile with
-`-fwrapv` or use unsigned types. In C the kernel measures **0.497 ns/check**.
 
 ## Commands
 
 ```
 python -m driftguard            an autonomous loop that starts drifting
 python -m driftguard --clean    the control
-python -m driftguard --bench    tokens saved vs waiting for the parser
-python -m driftguard --proof    the kernel over its complete domain
+python -m driftguard --bench    tokens saved by cutting early
+python -m driftguard --proof    the structural kernel's total proof
 ```
 
 Licensed commercially. See LICENSE. Not open source.
